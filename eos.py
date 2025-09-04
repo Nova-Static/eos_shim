@@ -1,8 +1,11 @@
-# eos_runtime.py
 import ctypes as C
+import json
 import os
 import sys
 from typing import Optional
+
+EOS_Success = 0
+EOS_LimitExceeded = 38
 
 def _libname() -> str:
     if sys.platform.startswith("win"):
@@ -14,20 +17,44 @@ def _libname() -> str:
 def _b(s: Optional[str]) -> Optional[bytes]:
     return None if s is None else s.encode("utf-8")
 
-EOS_Success = 0
-EOS_LimitExceeded = 38
+def _find_config(explicit: Optional[str] = None) -> str:
+    if explicit:
+        return explicit
+    env = os.environ.get("EOS_CONFIG")
+    if env:
+        return env
+    return os.path.join(os.getcwd(), "eos.json")
+
+def _load_config(path: Optional[str] = None) -> dict:
+    p = _find_config(path)
+    with open(p, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    required = [
+        "product_name", "product_version",
+        "product_id", "sandbox_id", "deployment_id",
+        "client_id", "client_secret"
+    ]
+    missing = [k for k in required if k not in cfg or cfg[k] in (None, "")]
+    if missing:
+        raise KeyError(f"Missing config keys: {', '.join(missing)}")
+    # Defaults
+    cfg.setdefault("encryption_key", None)
+    cfg.setdefault("cache_dir", None)
+    cfg.setdefault("is_server", False)
+    cfg.setdefault("tick_budget_ms", 0)
+    cfg.setdefault("tick_thread_ms", 16)
+    return cfg
 
 class EOS:
-    def __init__(self, lib_path: Optional[str] = None):
+    def __init__(self, lib_path: Optional[str] = None, config_path: Optional[str] = None):
         self._dll = C.CDLL(os.path.abspath(lib_path or _libname()))
+        self._cfg = _load_config(config_path)
         self._plat = C.c_void_p(0)
         self._acct: Optional[str] = None
         self._set_prototypes()
 
-    # -------- Prototypes --------
     def _set_prototypes(self) -> None:
         d = self._dll
-
         d.eos_initialize_basic.argtypes = [C.c_char_p, C.c_char_p]
         d.eos_initialize_basic.restype  = C.c_int
         d.eos_shutdown.argtypes = []
@@ -68,7 +95,6 @@ class EOS:
         d.eos_auth_get_login_status.argtypes     = [C.c_void_p, C.c_char_p]
         d.eos_auth_get_login_status.restype      = C.c_int
 
-    # -------- Helpers --------
     def _check(self, rc: int) -> None:
         if rc != EOS_Success:
             s = self._dll.eos_result_to_string(rc)
@@ -96,30 +122,38 @@ class EOS:
             raise RuntimeError("No EpicAccountId available")
         return aid.encode()
 
-    # -------- Lifecycle --------
-    def initialize(self, product_name: str, product_version: str) -> None:
-        self._check(self._dll.eos_initialize_basic(_b(product_name), _b(product_version)))
+    # Config-backed lifecycle
+    def bootstrap(self, start_tick_thread: bool = True) -> None:
+        self.initialize()
+        self.create_platform()
+        if start_tick_thread:
+            self.start_tick_thread(self._cfg.get("tick_thread_ms", 16))
+
+    def initialize(self) -> None:
+        self._check(self._dll.eos_initialize_basic(
+            _b(self._cfg["product_name"]),
+            _b(self._cfg["product_version"])
+        ))
 
     def shutdown(self) -> None:
         self.stop_tick_thread()
         self.release_platform()
         self._dll.eos_shutdown()
 
-    # -------- Platform --------
-    def create_platform(self,
-                        product_id: str, sandbox_id: str, deployment_id: str,
-                        client_id: str, client_secret: str,
-                        encryption_key: Optional[str] = None,
-                        cache_dir: Optional[str] = None,
-                        is_server: bool = False,
-                        tick_budget_ms: int = 0) -> None:
+    def create_platform(self) -> None:
         if self._plat:
             self.release_platform()
+        cfg = self._cfg
         h = self._dll.eos_platform_create_basic(
-            _b(product_id), _b(sandbox_id), _b(deployment_id),
-            _b(client_id), _b(client_secret),
-            _b(encryption_key), _b(cache_dir),
-            1 if is_server else 0, int(tick_budget_ms)
+            _b(cfg["product_id"]),
+            _b(cfg["sandbox_id"]),
+            _b(cfg["deployment_id"]),
+            _b(cfg["client_id"]),
+            _b(cfg["client_secret"]),
+            _b(cfg.get("encryption_key")),
+            _b(cfg.get("cache_dir")),
+            1 if cfg.get("is_server", False) else 0,
+            int(cfg.get("tick_budget_ms", 0))
         )
         if not h:
             raise RuntimeError("EOS_Platform_Create failed")
@@ -143,7 +177,7 @@ class EOS:
         if self._plat:
             self._dll.eos_platform_stop_tick_thread(self._plat)
 
-    # -------- Auth --------
+    # Auth
     def login_developer(self, tool_addr_port: str, dev_user_id: str, persist: bool = True) -> str:
         acct = self._buf_call(
             self._dll.eos_auth_login_developer,
@@ -201,7 +235,6 @@ class EOS:
     def get_login_status(self, epic_account_id: Optional[str] = None) -> int:
         return int(self._dll.eos_auth_get_login_status(self._need_platform(), self._need_account(epic_account_id)))
 
-    # -------- Context manager --------
     def __enter__(self):
         return self
 
