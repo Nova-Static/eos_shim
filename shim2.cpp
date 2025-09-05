@@ -171,6 +171,8 @@ struct PlatformShim {
     std::atomic<bool> run{false};
     std::thread tick_thread;
     int tick_ms{16};
+    std::mutex tick_mu; 
+
     ~PlatformShim() {
         stop_tick_thread();
         if (h) {
@@ -179,19 +181,32 @@ struct PlatformShim {
             h = nullptr;
         }
     }
+
+    void tick_once() {
+        std::lock_guard<std::mutex> lk(tick_mu);
+        if (h) EOS_Platform_Tick(h);
+    }
+
     void start_tick_thread(int period_ms) {
         if (run.load()) return;
         tick_ms = period_ms > 0 ? period_ms : 16;
         run.store(true);
         tick_thread = std::thread([this]{
             LOGI("Tick thread start (%d ms)", tick_ms);
+            #if defined(_WIN32)
+            if (HMODULE k=GetModuleHandleW(L"kernel32.dll")) {
+                if (auto p=(HRESULT(WINAPI*)(HANDLE,PCWSTR))GetProcAddress(k,"SetThreadDescription"))
+                    p(GetCurrentThread(), L"eos_shim_tick");
+            }
+            #endif
             while (run.load()) {
-                if (h) EOS_Platform_Tick(h);
+                tick_once();
                 std::this_thread::sleep_for(std::chrono::milliseconds(tick_ms));
             }
             LOGI("Tick thread stop");
         });
     }
+
     void stop_tick_thread() {
         if (!run.load()) return;
         run.store(false);
@@ -199,6 +214,7 @@ struct PlatformShim {
     }
     bool ticking() const { return run.load(); }
 };
+
 
 static inline const char* r2s(EOS_EResult r) {
     const char* s = EOS_EResult_ToString(r);
@@ -379,7 +395,7 @@ DLL_EXPORT void eos_platform_release(void* handle) {
 DLL_EXPORT void eos_platform_tick(void* handle) {
     auto* ps = reinterpret_cast<PlatformShim*>(handle);
     if (!ps || !ps->h) return;
-    EOS_Platform_Tick(ps->h);
+    ps->tick_once();
 }
 
 DLL_EXPORT int eos_platform_start_tick_thread(void* handle, int tick_period_ms) {
@@ -447,7 +463,8 @@ static EOS_EResult do_login_blocking(PlatformShim* ps,
     std::unique_lock<std::mutex> lk(st.m);
     while (!st.done) {
         lk.unlock();
-        if (ps && ps->h && !ps->ticking()) EOS_Platform_Tick(ps->h);
+        if (ps && ps->h && !ps->ticking())
+            ps->tick_once();
         std::this_thread::sleep_for(milliseconds(10));
         lk.lock();
         if (!st.done) st.cv.wait_for(lk, milliseconds(10));
