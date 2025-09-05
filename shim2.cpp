@@ -109,6 +109,7 @@ static void EOS_CALL eos_log_cb(const EOS_LogMessage* m) {
     LOGI("EOS[%d] %s", (int)m->Level, m->Message);
 #if defined(_WIN32)
     OutputDebugStringA(m->Message);
+    OutputDebugStringA("\n");
 #endif
 }
 
@@ -192,6 +193,47 @@ static EOS_HAuth auth_if(PlatformShim* ps) {
 }
 static EOS_HUserInfo userinfo_if(PlatformShim* ps) {
     return ps && ps->h ? EOS_Platform_GetUserInfoInterface(ps->h) : nullptr;
+}
+
+// ---------- Callback shims (correct calling convention) ----------
+static void EOS_CALL OnAuthLogin(const EOS_Auth_LoginCallbackInfo* info) {
+    auto* pst = static_cast<WaitState*>(info->ClientData);
+    if (!pst) return;
+    std::lock_guard<std::mutex> lk(pst->m);
+    pst->rc = info->ResultCode;
+    pst->epic_id = epic_id_to_str(info->LocalUserId);
+    pst->done = true;
+    pst->cv.notify_all();
+}
+
+struct LWait { std::mutex m; std::condition_variable cv; bool done{false}; EOS_EResult rc{EOS_UnexpectedError}; };
+static void EOS_CALL OnAuthLogout(const EOS_Auth_LogoutCallbackInfo* info) {
+    auto* pst = static_cast<LWait*>(info->ClientData);
+    if (!pst) return;
+    std::lock_guard<std::mutex> lk(pst->m);
+    pst->rc = info->ResultCode;
+    pst->done = true;
+    pst->cv.notify_all();
+}
+
+struct QWait { std::mutex m; std::condition_variable cv; bool done{false}; EOS_EResult rc{EOS_UnexpectedError}; };
+static void EOS_CALL OnQueryIdToken(const EOS_Auth_QueryIdTokenCallbackInfo* info) {
+    auto* pst = static_cast<QWait*>(info->ClientData);
+    if (!pst) return;
+    std::lock_guard<std::mutex> lk(pst->m);
+    pst->rc = info->ResultCode;
+    pst->done = true;
+    pst->cv.notify_all();
+}
+
+struct UIWait { std::mutex m; std::condition_variable cv; bool done{false}; EOS_EResult rc{EOS_UnexpectedError}; };
+static void EOS_CALL OnUserInfoQuery(const EOS_UserInfo_QueryUserInfoCallbackInfo* info) {
+    auto* pst = static_cast<UIWait*>(info->ClientData);
+    if (!pst) return;
+    std::lock_guard<std::mutex> lk(pst->m);
+    pst->rc = info->ResultCode;
+    pst->done = true;
+    pst->cv.notify_all();
 }
 
 // ---------- Core ----------
@@ -347,15 +389,7 @@ static EOS_EResult do_login_blocking(PlatformShim* ps,
          st.creds.Token ? "(set)" : "(null)",
          persist ? 1 : 0);
 
-    EOS_Auth_Login(h, &st.opts, &st,
-        [](const EOS_Auth_LoginCallbackInfo* info){
-            auto* pst = static_cast<WaitState*>(info->ClientData);
-            std::lock_guard<std::mutex> lk(pst->m);
-            pst->rc = info->ResultCode;
-            pst->epic_id = epic_id_to_str(info->LocalUserId);
-            pst->done = true;
-            pst->cv.notify_all();
-        });
+    EOS_Auth_Login(h, &st.opts, &st, &OnAuthLogin);
 
     using namespace std::chrono;
     std::unique_lock<std::mutex> lk(st.m);
@@ -439,22 +473,13 @@ DLL_EXPORT int eos_auth_logout(void* handle,
     EOS_EpicAccountId account = EOS_EpicAccountId_FromString(epic_account_id_str);
     if (!account) return (int)EOS_InvalidAuth;
 
-    struct LWait {
-        std::mutex m; std::condition_variable cv; bool done{false}; EOS_EResult rc{EOS_UnexpectedError};
-    } st;
+    LWait st;
 
     EOS_Auth_LogoutOptions opts{};
     opts.ApiVersion = EOS_AUTH_LOGOUT_API_LATEST;
     opts.LocalUserId = account;
 
-    EOS_Auth_Logout(h, &opts, &st,
-        [](const EOS_Auth_LogoutCallbackInfo* info){
-            auto* pst = static_cast<LWait*>(info->ClientData);
-            std::lock_guard<std::mutex> lk(pst->m);
-            pst->rc = info->ResultCode;
-            pst->done = true;
-            pst->cv.notify_all();
-        });
+    EOS_Auth_Logout(h, &opts, &st, &OnAuthLogout);
 
     using namespace std::chrono;
     std::unique_lock<std::mutex> lk(st.m);
@@ -506,19 +531,13 @@ DLL_EXPORT int eos_auth_query_id_token(void* handle,
     EOS_EpicAccountId account = EOS_EpicAccountId_FromString(epic_account_id_str);
     if (!account) return (int)EOS_InvalidAuth;
 
-    struct QWait { std::mutex m; std::condition_variable cv; bool done{false}; EOS_EResult rc{EOS_UnexpectedError}; } st;
+    QWait st;
 
     EOS_Auth_QueryIdTokenOptions q{};
     q.ApiVersion = EOS_AUTH_QUERYIDTOKEN_API_LATEST;
     q.AccountId  = account;
 
-    EOS_Auth_QueryIdToken(h, &q, &st, [](const EOS_Auth_QueryIdTokenCallbackInfo* info){
-        auto* pst = static_cast<QWait*>(info->ClientData);
-        std::lock_guard<std::mutex> lk(pst->m);
-        pst->rc = info->ResultCode;
-        pst->done = true;
-        pst->cv.notify_all();
-    });
+    EOS_Auth_QueryIdToken(h, &q, &st, &OnQueryIdToken);
 
     using namespace std::chrono;
     std::unique_lock<std::mutex> lk(st.m);
@@ -585,7 +604,7 @@ DLL_EXPORT int eos_userinfo_query(void* handle,
     EOS_EpicAccountId target = EOS_EpicAccountId_FromString(target_epic_account_id);
     if (!local || !target) return (int)EOS_InvalidAuth;
 
-    struct UIWait { std::mutex m; std::condition_variable cv; bool done{false}; EOS_EResult rc{EOS_UnexpectedError}; } st;
+    UIWait st;
 
     EOS_UserInfo_QueryUserInfoOptions q{};
     q.ApiVersion   = EOS_USERINFO_QUERYUSERINFO_API_LATEST;
@@ -596,13 +615,7 @@ DLL_EXPORT int eos_userinfo_query(void* handle,
          local_epic_account_id ? local_epic_account_id : "(null)",
          target_epic_account_id ? target_epic_account_id : "(null)");
 
-    EOS_UserInfo_QueryUserInfo(ui, &q, &st, [](const EOS_UserInfo_QueryUserInfoCallbackInfo* info){
-        auto* pst = static_cast<UIWait*>(info->ClientData);
-        std::lock_guard<std::mutex> lk(pst->m);
-        pst->rc = info->ResultCode;
-        pst->done = true;
-        pst->cv.notify_all();
-    });
+    EOS_UserInfo_QueryUserInfo(ui, &q, &st, &OnUserInfoQuery);
 
     using namespace std::chrono;
     std::unique_lock<std::mutex> lk(st.m);
