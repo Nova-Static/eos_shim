@@ -66,32 +66,84 @@ static void logf(const char* lvl, const char* fmt, ...) {
 
 // ---------- Crash logging ----------
 #if defined(_WIN32)
-static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* ep) {
-    LOGE("SEH exception code=0x%08X at %p", ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+#include <atomic>
+
+static bool write_minidump(EXCEPTION_POINTERS* ep) {
     HMODULE hDbg = LoadLibraryA("dbghelp.dll");
-    if (hDbg) {
-        auto pMiniDumpWriteDump = (BOOL (WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
-            PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION))
-            GetProcAddress(hDbg, "MiniDumpWriteDump");
-        if (pMiniDumpWriteDump) {
-            HANDLE hFile = CreateFileA("eos_shim.dmp", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (hFile != INVALID_HANDLE_VALUE) {
-                MINIDUMP_EXCEPTION_INFORMATION mei{};
-                mei.ThreadId = GetCurrentThreadId();
-                mei.ExceptionPointers = ep;
-                mei.ClientPointers = FALSE;
-                pMiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), hFile,
-                                   (MINIDUMP_TYPE)(MiniDumpWithIndirectlyReferencedMemory | MiniDumpScanMemory),
-                                   &mei, nullptr, nullptr);
-                CloseHandle(hFile);
-                LOGE("Wrote eos_shim.dmp");
-            }
-        }
-        FreeLibrary(hDbg);
+    if (!hDbg) return false;
+    auto pMiniDumpWriteDump = (BOOL (WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
+        PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION))
+        GetProcAddress(hDbg, "MiniDumpWriteDump");
+    if (!pMiniDumpWriteDump) { FreeLibrary(hDbg); return false; }
+
+    HANDLE hFile = CreateFileA("eos_shim.dmp", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) { FreeLibrary(hDbg); return false; }
+
+    MINIDUMP_EXCEPTION_INFORMATION mei{};
+    mei.ThreadId = GetCurrentThreadId();
+    mei.ExceptionPointers = ep;
+    mei.ClientPointers = FALSE;
+
+    BOOL ok = pMiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), hFile,
+                                 (MINIDUMP_TYPE)(MiniDumpWithIndirectlyReferencedMemory | MiniDumpScanMemory),
+                                 &mei, nullptr, nullptr);
+    CloseHandle(hFile);
+    FreeLibrary(hDbg);
+    if (ok) LOGE("Wrote eos_shim.dmp");
+    return ok == TRUE;
+}
+
+static bool is_fatal_exception(DWORD code) {
+    switch (code) {
+        case 0xC0000005: /* STATUS_ACCESS_VIOLATION */ return true;
+        case 0xC000001D: /* STATUS_ILLEGAL_INSTRUCTION */ return true;
+        case 0xC0000094: /* STATUS_INTEGER_DIVIDE_BY_ZERO */ return true;
+        case 0xC0000095: /* STATUS_INTEGER_OVERFLOW */ return true;
+        case 0xC00000FD: /* STATUS_STACK_OVERFLOW */ return true;
+        case 0xC0000409: /* STATUS_STACK_BUFFER_OVERRUN */ return true;
+        default: return false;
+    }
+}
+
+// Optional: suppress dump storms
+static std::atomic<int> g_dumps{0};
+
+static LONG WINAPI seh_unhandled_filter(EXCEPTION_POINTERS* ep) {
+    DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
+    LOGE("UNHANDLED SEH code=0x%08X at %p", code,
+         ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr);
+    if (is_fatal_exception(code) && g_dumps.fetch_add(1) == 0) {
+        write_minidump(ep);
+    }
+    // let the process terminate with the unhandled exception
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// If you insist on a vectored handler (not recommended), FILTER it:
+static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* ep) {
+    DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
+
+    // Ignore common first-chance, benign exceptions
+    switch (code) {
+        case 0x80000003: /* STATUS_BREAKPOINT */ return EXCEPTION_CONTINUE_SEARCH;
+        case 0x406D1388: /* MSVC SetThreadName */ return EXCEPTION_CONTINUE_SEARCH;
+        case 0x40010006: /* DBG_PRINTEXCEPTION_C */ return EXCEPTION_CONTINUE_SEARCH;
+        case 0xE06D7363: /* C++ EH */ return EXCEPTION_CONTINUE_SEARCH;
+        default: break;
+    }
+
+    if (!is_fatal_exception(code)) return EXCEPTION_CONTINUE_SEARCH;
+
+    // Only log once per process to avoid floods
+    if (g_dumps.fetch_add(1) == 0) {
+        LOGE("SEH exception code=0x%08X at %p", code,
+             ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr);
+        write_minidump(ep);
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
 #else
+// POSIX unchanged
 static void sig_handler(int sig) {
     LOGE("Signal %d", sig);
     void* addrs[64]; int n = backtrace(addrs, 64);
