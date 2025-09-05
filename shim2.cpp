@@ -173,6 +173,11 @@ struct PlatformShim {
     int tick_ms{16};
     std::mutex tick_mu; 
 
+    // OWNED COPIES to keep EOS pointers valid
+    std::string s_product_id, s_sandbox_id, s_deployment_id;
+    std::string s_client_id, s_client_secret;
+    std::string s_encryption_key, s_cache_dir;
+
     ~PlatformShim() {
         stop_tick_thread();
         if (h) {
@@ -348,42 +353,44 @@ DLL_EXPORT void* eos_platform_create_basic(const char* product_id,
                                            const char* cache_dir,
                                            int is_server,
                                            int tick_budget_ms) {
-    LOGI("platform_create pid=%s sbx=%s dep=%s cid=%s is_server=%d tick=%d enc=%s cache=%s",
-         product_id ? product_id : "(null)",
-         sandbox_id ? sandbox_id : "(null)",
-         deployment_id ? deployment_id : "(null)",
-         client_id ? "(redacted)" : "(null)",
-         is_server, tick_budget_ms,
-         encryption_key ? "(set)" : "(null)",
-         cache_dir ? cache_dir : "(null)");
+    auto* ps = new PlatformShim();
+
+    // take ownership of all inputs
+    ps->s_product_id    = product_id    ? product_id    : "";
+    ps->s_sandbox_id    = sandbox_id    ? sandbox_id    : "";
+    ps->s_deployment_id = deployment_id ? deployment_id : "";
+    ps->s_client_id     = client_id     ? client_id     : "";
+    ps->s_client_secret = client_secret ? client_secret : "";
+    ps->s_encryption_key= encryption_key? encryption_key: "";
+    ps->s_cache_dir     = cache_dir     ? cache_dir     : "";
 
     EOS_Platform_ClientCredentials creds{};
-    creds.ApiVersion  = EOS_PLATFORM_CLIENTCREDENTIALS_API_LATEST;
-    creds.ClientId    = client_id;
-    creds.ClientSecret= client_secret;
+    creds.ApiVersion   = EOS_PLATFORM_CLIENTCREDENTIALS_API_LATEST;
+    creds.ClientId     = ps->s_client_id.empty()     ? nullptr : ps->s_client_id.c_str();
+    creds.ClientSecret = ps->s_client_secret.empty() ? nullptr : ps->s_client_secret.c_str();
 
     EOS_Platform_Options opts{};
-    opts.ApiVersion = EOS_PLATFORM_OPTIONS_API_LATEST;
-    opts.ProductId  = product_id;
-    opts.SandboxId  = sandbox_id;
-    opts.DeploymentId = deployment_id;
-    opts.ClientCredentials = creds;
-    opts.EncryptionKey = (encryption_key && *encryption_key) ? encryption_key : nullptr;
-    opts.CacheDirectory= (cache_dir && *cache_dir) ? cache_dir : nullptr;
-    opts.bIsServer = is_server ? EOS_TRUE : EOS_FALSE;
-    opts.TickBudgetInMilliseconds = tick_budget_ms;
+    opts.ApiVersion                 = EOS_PLATFORM_OPTIONS_API_LATEST;
+    opts.ProductId                  = ps->s_product_id.empty()    ? nullptr : ps->s_product_id.c_str();
+    opts.SandboxId                  = ps->s_sandbox_id.empty()    ? nullptr : ps->s_sandbox_id.c_str();
+    opts.DeploymentId               = ps->s_deployment_id.empty() ? nullptr : ps->s_deployment_id.c_str();
+    opts.ClientCredentials          = creds;
+    opts.EncryptionKey              = ps->s_encryption_key.empty() ? nullptr : ps->s_encryption_key.c_str();
+    opts.CacheDirectory             = ps->s_cache_dir.empty()      ? nullptr : ps->s_cache_dir.c_str();
+    opts.bIsServer                  = is_server ? EOS_TRUE : EOS_FALSE;
+    opts.TickBudgetInMilliseconds   = tick_budget_ms;
 
-    EOS_HPlatform h = EOS_Platform_Create(&opts);
-    if (!h) {
+    ps->h = EOS_Platform_Create(&opts);
+    if (!ps->h) {
         LOGE("EOS_Platform_Create -> NULL");
+        delete ps;
         return nullptr;
     }
 
-    auto* ps = new PlatformShim();
-    ps->h = h;
-    LOGI("platform handle=%p", (void*)ps->h);
+    g_platform_live.fetch_add(1, std::memory_order_acq_rel);
+    LOGI("platform handle=%p h=%p", (void*)ps, (void*)ps->h);
     return reinterpret_cast<void*>(ps);
-}
+}}
 
 DLL_EXPORT void eos_platform_release(void* handle) {
     LOGI("platform_release handle=%p", handle);
