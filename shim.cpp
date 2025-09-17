@@ -13,6 +13,7 @@
 #include <thread>
 #include <chrono>
 #include <unordered_map>
+#include <memory>
 
 #include "eos_sdk.h"
 #include "eos_platform.h"
@@ -24,6 +25,31 @@
   #define DLL_EXPORT extern "C" __attribute__((visibility("default")))
 #endif
 
+struct LoginCredentialHold {
+    std::string id;
+    std::string token;
+    EOS_Auth_Credentials creds{};
+    EOS_Auth_LoginOptions opts{};
+
+    LoginCredentialHold(EOS_ELoginCredentialType type,
+                        const char* id_in,
+                        const char* token_in,
+                        bool persist) {
+        id = id_in ? id_in : "";
+        token = token_in ? token_in : "";
+
+        creds.ApiVersion = EOS_AUTH_CREDENTIALS_API_LATEST;
+        creds.Type = type;
+        creds.Id = id.empty() ? nullptr : id.c_str();
+        creds.Token = token.empty() ? nullptr : token.c_str();
+
+        opts.ApiVersion = EOS_AUTH_LOGIN_API_LATEST;
+        opts.Credentials = &creds;
+        opts.ScopeFlags = EOS_AS_BasicProfile | EOS_AS_FriendsList;
+        opts.bPersistLogin = persist ? EOS_TRUE : EOS_FALSE;
+    }
+};
+
 struct PlatformShim {
     EOS_HPlatform h{nullptr};
     std::atomic<bool> run{false};
@@ -31,12 +57,8 @@ struct PlatformShim {
     int tick_ms{16};
     std::mutex tick_mu;
 
-    struct LoginStrings {
-        std::string id;
-        std::string token;
-    };
     std::mutex login_mu;
-    std::unordered_map<std::string, LoginStrings> active_logins;
+    std::unordered_map<std::string, std::shared_ptr<LoginCredentialHold>> active_logins;
 
     // retain copies of input strings so EOS can reference them safely
     std::string s_product_id, s_sandbox_id, s_deployment_id;
@@ -71,13 +93,10 @@ struct PlatformShim {
     }
 
     void remember_login(const std::string& epic_id,
-                        const std::string& id,
-                        const std::string& token) {
-        if (epic_id.empty()) return;
+                        const std::shared_ptr<LoginCredentialHold>& hold) {
+        if (epic_id.empty() || !hold) return;
         std::lock_guard<std::mutex> lk(login_mu);
-        auto& slot = active_logins[epic_id];
-        slot.id = id;
-        slot.token = token;
+        active_logins[epic_id] = hold;
     }
 
     void forget_login(const std::string& epic_id) {
@@ -120,11 +139,7 @@ struct WaitState {
     EOS_EResult rc{EOS_UnexpectedError};
     std::string epic_id;
 
-    // owned storage for async EOS_Auth_Login inputs
-    std::string id_s;
-    std::string token_s;
-    EOS_Auth_Credentials creds{};
-    EOS_Auth_LoginOptions opts{};
+    std::shared_ptr<LoginCredentialHold> cred_hold;
 };
 
 static EOS_HAuth auth_if(PlatformShim* ps) {
@@ -231,20 +246,15 @@ static EOS_EResult do_login_blocking(PlatformShim* ps,
     if (!h) return EOS_InvalidAuth;
 
     WaitState st;
-    st.id_s    = id    ? id    : "";
-    st.token_s = token ? token : "";
+    st.cred_hold = std::make_shared<LoginCredentialHold>(type, id, token, persist);
 
-    st.creds.ApiVersion = EOS_AUTH_CREDENTIALS_API_LATEST;
-    st.creds.Type = type;
-    st.creds.Id = st.id_s.empty() ? nullptr : st.id_s.c_str();
-    st.creds.Token = st.token_s.empty() ? nullptr : st.token_s.c_str();
+    EOS_Auth_LoginOptions* opts = st.cred_hold ? &st.cred_hold->opts : nullptr;
+    if (!opts) {
+        out_epic_id.clear();
+        return EOS_OutOfMemory;
+    }
 
-    st.opts.ApiVersion = EOS_AUTH_LOGIN_API_LATEST;
-    st.opts.Credentials = &st.creds;
-    st.opts.ScopeFlags = EOS_AS_BasicProfile | EOS_AS_FriendsList;
-    st.opts.bPersistLogin = persist ? EOS_TRUE : EOS_FALSE;
-
-    EOS_Auth_Login(h, &st.opts, &st,
+    EOS_Auth_Login(h, opts, &st,
         [](const EOS_Auth_LoginCallbackInfo* info){
             auto* pst = static_cast<WaitState*>(info->ClientData);
             std::lock_guard<std::mutex> lk(pst->m);
@@ -265,7 +275,7 @@ static EOS_EResult do_login_blocking(PlatformShim* ps,
 
     std::string epic_id = std::move(st.epic_id);
     if (st.rc == EOS_Success && ps) {
-        ps->remember_login(epic_id, st.id_s, st.token_s);
+        ps->remember_login(epic_id, st.cred_hold);
     }
     out_epic_id = std::move(epic_id);
     return st.rc;
