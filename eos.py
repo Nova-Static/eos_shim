@@ -2,10 +2,35 @@ import ctypes as C
 import json
 import os
 import sys
-from typing import Optional
+from typing import Dict, Optional
 
 EOS_Success = 0
 EOS_LimitExceeded = 38
+
+_PLATFORM_REFS: Dict[int, C.c_void_p] = {}
+
+
+def _as_c_void_p(handle) -> C.c_void_p:
+    """Normalize arbitrary handle inputs to a ctypes void* without double-wrapping."""
+    if isinstance(handle, C.c_void_p):
+        return handle
+    if handle is None:
+        return C.c_void_p(0)
+    return C.c_void_p(int(handle))
+
+
+def _retain_platform(handle) -> C.c_void_p:
+    """Remember a platform handle for the process lifetime until an explicit release."""
+    h = _as_c_void_p(handle)
+    if h and h.value:
+        _PLATFORM_REFS[h.value] = h
+    return h
+
+
+def _forget_platform(handle) -> None:
+    h = _as_c_void_p(handle)
+    if h and h.value:
+        _PLATFORM_REFS.pop(h.value, None)
 
 def _libname() -> str:
     if sys.platform.startswith("win"):
@@ -114,7 +139,7 @@ class EOS:
         return buf.value.decode()
 
     def _need_platform(self) -> C.c_void_p:
-        if not self._plat:
+        if not self._plat or not self._plat.value:
             raise RuntimeError("Platform not created")
         return self._plat
 
@@ -166,24 +191,25 @@ class EOS:
         )
         if not h:
             raise RuntimeError("EOS_Platform_Create failed")
-        self._plat = C.c_void_p(h)
+        self._plat = _retain_platform(h)
 
     def release_platform(self) -> None:
         if self._plat:
             self._dll.eos_platform_release(self._plat)
+            _forget_platform(self._plat)
             self._plat = C.c_void_p(0)
         self._acct = None
 
     def tick(self) -> None:
-        if self._plat:
+        if self._plat and self._plat.value:
             self._dll.eos_platform_tick(self._plat)
 
     def start_tick_thread(self, period_ms: int = 16) -> None:
-        if self._plat:
+        if self._plat and self._plat.value:
             self._check(self._dll.eos_platform_start_tick_thread(self._plat, int(period_ms)))
 
     def stop_tick_thread(self) -> None:
-        if self._plat:
+        if self._plat and self._plat.value:
             self._dll.eos_platform_stop_tick_thread(self._plat)
 
     # Auth

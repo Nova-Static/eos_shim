@@ -4,6 +4,7 @@
 import ctypes as C
 import os
 import sys
+from typing import Dict
 
 if sys.platform.startswith("win"):
     _LIB = "eos_shim.dll"
@@ -13,6 +14,29 @@ else:
     _LIB = "libeos_shim.so"
 
 _dll = C.CDLL(os.path.abspath(_LIB))
+
+_PLATFORM_REFS: Dict[int, C.c_void_p] = {}
+
+
+def _as_c_void_p(handle) -> C.c_void_p:
+    if isinstance(handle, C.c_void_p):
+        return handle
+    if handle is None:
+        return C.c_void_p(0)
+    return C.c_void_p(int(handle))
+
+
+def _retain_platform(handle) -> C.c_void_p:
+    h = _as_c_void_p(handle)
+    if h and h.value:
+        _PLATFORM_REFS[h.value] = h
+    return h
+
+
+def _forget_platform(handle) -> None:
+    h = _as_c_void_p(handle)
+    if h and h.value:
+        _PLATFORM_REFS.pop(h.value, None)
 
 # Prototypes
 _dll.eos_initialize_basic.argtypes = [C.c_char_p, C.c_char_p]
@@ -97,19 +121,27 @@ def platform_create_basic(product_id: str, sandbox_id: str, deployment_id: str,
     )
     if not h:
         raise RuntimeError("EOS_Platform_Create failed")
-    return h
+    return _retain_platform(h)
 
 def platform_release(handle: int) -> None:
-    _dll.eos_platform_release(handle)
+    h = _as_c_void_p(handle)
+    _dll.eos_platform_release(h)
+    _forget_platform(h)
 
 def platform_tick(handle: int) -> None:
-    _dll.eos_platform_tick(handle)
+    h = _as_c_void_p(handle)
+    if h and h.value:
+        _dll.eos_platform_tick(h)
 
 def platform_start_tick_thread(handle: int, period_ms: int = 16) -> None:
-    _check(_dll.eos_platform_start_tick_thread(handle, int(period_ms)))
+    h = _as_c_void_p(handle)
+    if h and h.value:
+        _check(_dll.eos_platform_start_tick_thread(h, int(period_ms)))
 
 def platform_stop_tick_thread(handle: int) -> None:
-    _dll.eos_platform_stop_tick_thread(handle)
+    h = _as_c_void_p(handle)
+    if h and h.value:
+        _dll.eos_platform_stop_tick_thread(h)
 
 def _call_with_buffer(fn, *args) -> str:
     size = C.c_int32(256)
@@ -122,28 +154,36 @@ def _call_with_buffer(fn, *args) -> str:
     return buf.value.decode()
 
 def auth_login_exchange_code(handle: int, exchange_code: str, persist: bool = True) -> str:
-    return _call_with_buffer(_dll.eos_auth_login_exchange_code, handle, exchange_code.encode(), 1 if persist else 0)
+    h = _as_c_void_p(handle)
+    return _call_with_buffer(_dll.eos_auth_login_exchange_code, h, exchange_code.encode(), 1 if persist else 0)
 
 def auth_login_password(handle: int, user_id: str, secret: str, persist: bool = True) -> str:
-    return _call_with_buffer(_dll.eos_auth_login_password, handle, user_id.encode(), secret.encode(), 1 if persist else 0)
+    h = _as_c_void_p(handle)
+    return _call_with_buffer(_dll.eos_auth_login_password, h, user_id.encode(), secret.encode(), 1 if persist else 0)
 
 def auth_login_developer(handle: int, tool_addr_port: str, dev_user_id: str, persist: bool = True) -> str:
-    return _call_with_buffer(_dll.eos_auth_login_developer, handle, tool_addr_port.encode(), dev_user_id.encode(), 1 if persist else 0)
+    h = _as_c_void_p(handle)
+    return _call_with_buffer(_dll.eos_auth_login_developer, h, tool_addr_port.encode(), dev_user_id.encode(), 1 if persist else 0)
 
 def auth_logout(handle: int, epic_account_id: str) -> None:
-    _check(_dll.eos_auth_logout(handle, epic_account_id.encode()))
+    h = _as_c_void_p(handle)
+    _check(_dll.eos_auth_logout(h, epic_account_id.encode()))
 
 def auth_copy_user_auth_token(handle: int, epic_account_id: str) -> str:
-    return _call_with_buffer(_dll.eos_auth_copy_user_auth_token, handle, epic_account_id.encode())
+    h = _as_c_void_p(handle)
+    return _call_with_buffer(_dll.eos_auth_copy_user_auth_token, h, epic_account_id.encode())
 
 def auth_query_id_token(handle: int, epic_account_id: str) -> None:
-    _check(_dll.eos_auth_query_id_token(handle, epic_account_id.encode()))
+    h = _as_c_void_p(handle)
+    _check(_dll.eos_auth_query_id_token(h, epic_account_id.encode()))
 
 def auth_copy_id_token(handle: int, epic_account_id: str) -> str:
-    return _call_with_buffer(_dll.eos_auth_copy_id_token, handle, epic_account_id.encode())
+    h = _as_c_void_p(handle)
+    return _call_with_buffer(_dll.eos_auth_copy_id_token, h, epic_account_id.encode())
 
 def auth_get_login_status(handle: int, epic_account_id: str) -> int:
-    return int(_dll.eos_auth_get_login_status(handle, epic_account_id.encode()))
+    h = _as_c_void_p(handle)
+    return int(_dll.eos_auth_get_login_status(h, epic_account_id.encode()))
 
 if __name__ == "__main__":
     initialize("MyProduct", "1.0")
