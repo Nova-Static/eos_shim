@@ -58,6 +58,9 @@ _dll.eos_auth_get_login_status.restype      = C.c_int
 EOS_Success = 0
 EOS_LimitExceeded = 38  # buffer too small sentinel from EOS
 
+_init_product_name: bytes | None = None
+_init_product_version: bytes | None = None
+
 def _result_to_str(rc: int) -> str:
     p = _dll.eos_result_to_string(int(rc))
     return p.decode("utf-8", "ignore") if p else ""
@@ -67,10 +70,16 @@ def _check(rc: int) -> None:
         raise RuntimeError(f"EOS error {rc} ({_result_to_str(rc)})")
 
 def initialize(product_name: str, product_version: str) -> None:
-    _check(_dll.eos_initialize_basic(product_name.encode(), product_version.encode()))
+    global _init_product_name, _init_product_version
+    _init_product_name = product_name.encode()
+    _init_product_version = product_version.encode()
+    _check(_dll.eos_initialize_basic(_init_product_name, _init_product_version))
 
 def shutdown() -> None:
+    global _init_product_name, _init_product_version
     _dll.eos_shutdown()
+    _init_product_name = None
+    _init_product_version = None
 
 def platform_create_basic(product_id: str, sandbox_id: str, deployment_id: str,
                           client_id: str, client_secret: str,

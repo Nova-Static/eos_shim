@@ -51,6 +51,8 @@ class EOS:
         self._cfg = _load_config(config_path)
         self._plat = C.c_void_p(0)
         self._acct: Optional[str] = None
+        self._init_product_name: Optional[bytes] = None
+        self._init_product_version: Optional[bytes] = None
         self._set_prototypes()
 
     def _set_prototypes(self) -> None:
@@ -130,15 +132,22 @@ class EOS:
             self.start_tick_thread(self._cfg.get("tick_thread_ms", 16))
 
     def initialize(self) -> None:
+        # Keep the initialization strings alive for the duration of the SDK session.
+        # EOS may continue to reference the pointers provided in EOS_Initialize after
+        # the call returns, so we retain the encoded bytes until shutdown.
+        self._init_product_name = _b(self._cfg["product_name"])
+        self._init_product_version = _b(self._cfg["product_version"])
         self._check(self._dll.eos_initialize_basic(
-            _b(self._cfg["product_name"]),
-            _b(self._cfg["product_version"])
+            self._init_product_name,
+            self._init_product_version
         ))
 
     def shutdown(self) -> None:
         self.stop_tick_thread()
         self.release_platform()
         self._dll.eos_shutdown()
+        self._init_product_name = None
+        self._init_product_version = None
 
     def create_platform(self) -> None:
         if self._plat:
